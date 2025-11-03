@@ -1,16 +1,17 @@
 # tools/aggregate_and_translate.py
 # ------------------------------------------------------------
-# GitHub Actions から実行して、
-#  - feeds.txt のRSSを取得
-#  - 重複排除・整形
-#  - （任意）LibreTranslate で title/summary を翻訳
-#  - Base44推奨フォーマットの feed.json を docs/ に出力
+# - feeds.txt のRSSを取得
+# - 重複排除・整形
+# - （任意）LibreTranslateで title/summary を翻訳（未設定ならオフ）
+# - Base44推奨スキーマで docs/feed.json を出力
+# - data/news_sources.csv を使って country/continent/language を付与
 # ------------------------------------------------------------
 
 import os
 import json
 import time
 import hashlib
+import csv
 from urllib.parse import urlparse
 
 import feedparser
@@ -21,6 +22,9 @@ from datetime import datetime, timezone
 
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 DOCS_PATH = os.path.join(REPO_ROOT, "docs")
+DATA_PATH = os.path.join(REPO_ROOT, "data")
+CATALOG_CSV = os.path.join(DATA_PATH, "news_sources.csv")
+
 FEED_OUT = os.path.join(DOCS_PATH, "feed.json")
 FEEDS_TXT = os.path.join(REPO_ROOT, "feeds.txt")
 
@@ -28,58 +32,6 @@ TARGET_LANG = os.getenv("TARGET_LANG", "ja")  # 翻訳のターゲット言語�
 LT_URL = os.getenv("LT_URL", "").rstrip("/")  # LibreTranslate のURL（未設定なら翻訳OFF）
 LT_API_KEY = os.getenv("LT_API_KEY", "")      # LibreTranslateのAPIキー（無くても可）
 
-# --- 地域推定: ccTLD(最終ラベル) → (国, 大陸)（日本語表記）
-COUNTRY_MAP = {
-    "us": ("アメリカ", "北アメリカ"),
-    "ca": ("カナダ", "北アメリカ"),
-    "mx": ("メキシコ", "北アメリカ"),
-    "br": ("ブラジル", "南アメリカ"),
-    "ar": ("アルゼンチン", "南アメリカ"),
-    "uk": ("イギリス", "ヨーロッパ"),
-    "de": ("ドイツ", "ヨーロッパ"),
-    "fr": ("フランス", "ヨーロッパ"),
-    "es": ("スペイン", "ヨーロッパ"),
-    "it": ("イタリア", "ヨーロッパ"),
-    "nl": ("オランダ", "ヨーロッパ"),
-    "se": ("スウェーデン", "ヨーロッパ"),
-    "no": ("ノルウェー", "ヨーロッパ"),
-    "dk": ("デンマーク", "ヨーロッパ"),
-    "pl": ("ポーランド", "ヨーロッパ"),
-    "pt": ("ポルトガル", "ヨーロッパ"),
-    "ie": ("アイルランド", "ヨーロッパ"),
-    "ch": ("スイス", "ヨーロッパ"),
-    "ru": ("ロシア", "ヨーロッパ/アジア"),
-    "tr": ("トルコ", "ヨーロッパ/アジア"),
-    "ua": ("ウクライナ", "ヨーロッパ"),
-    "cz": ("チェコ", "ヨーロッパ"),
-    "hu": ("ハンガリー", "ヨーロッパ"),
-    "ro": ("ルーマニア", "ヨーロッパ"),
-    "gr": ("ギリシャ", "ヨーロッパ"),
-    "fi": ("フィンランド", "ヨーロッパ"),
-    "cn": ("中国", "アジア"),
-    "jp": ("日本", "アジア"),
-    "kr": ("韓国", "アジア"),
-    "tw": ("台湾", "アジア"),
-    "hk": ("香港", "アジア"),
-    "sg": ("シンガポール", "アジア"),
-    "in": ("インド", "アジア"),
-    "id": ("インドネシア", "アジア"),
-    "th": ("タイ", "アジア"),
-    "vn": ("ベトナム", "アジア"),
-    "my": ("マレーシア", "アジア"),
-    "ph": ("フィリピン", "アジア"),
-    "au": ("オーストラリア", "オセアニア"),
-    "nz": ("ニュージーランド", "オセアニア"),
-    "za": ("南アフリカ", "アフリカ"),
-    "ng": ("ナイジェリア", "アフリカ"),
-    "eg": ("エジプト", "アフリカ"),
-    "ke": ("ケニア", "アフリカ"),
-    "sa": ("サウジアラビア", "中東"),
-    "ae": ("アラブ首長国連邦", "中東"),
-    "ir": ("イラン", "中東"),
-    "il": ("イスラエル", "中東"),
-    # 必要に応じて追加
-}
 
 def norm_dt(entry):
     """RSSエントリからISO8601(UTC)の日時文字列を得る。なければ現在時刻。"""
@@ -97,10 +49,12 @@ def norm_dt(entry):
             pass
     return datetime.now(timezone.utc).isoformat()
 
+
 def identity(item):
     """重複排除用ハッシュ。link > id > タイトル+ソース。"""
     base = item.get("link") or item.get("id") or (item.get("title","") + item.get("source",""))
     return hashlib.sha256(base.encode("utf-8", errors="ignore")).hexdigest()
+
 
 def maybe_translate(text, src_hint=None):
     """LibreTranslate が設定されていれば翻訳。未設定/失敗時は原文返し。"""
@@ -123,15 +77,16 @@ def maybe_translate(text, src_hint=None):
         pass
     return text, lang
 
+
 def clamp(s, n=280):
     s = (s or "").strip()
     return s if len(s) <= n else s[:n-1] + "…"
+
 
 def extract_category(entry):
     """feedparserのtags等からカテゴリを抽出。無ければ 'general'。"""
     try:
         if hasattr(entry, "tags") and entry.tags:
-            # 最初のタグの term or label を採用
             tag = entry.tags[0]
             for k in ("term", "label"):
                 if k in tag and tag[k]:
@@ -140,25 +95,93 @@ def extract_category(entry):
         pass
     return "general"
 
-def guess_region(link):
-    """URLのTLDから (国, 大陸) を推定。失敗時は '不明'。"""
+
+# ========= ここから：CSVカタログの読み込み & 照合 =========
+
+def _netloc(url: str) -> str:
     try:
-        netloc = urlparse(link).netloc.lower()
-        # 例: www.bbc.co.uk -> tld 'uk'; nytimes.com -> 'com'
-        tld = netloc.split(".")[-1]
-        # com/net/org などは国判定できない
-        if tld in COUNTRY_MAP:
-            return COUNTRY_MAP[tld]
-        # 例外的に co.uk / com.au などの最後が2文字じゃないケースは最後を優先
-        # すでに tld は最後ラベルなので、ここではこれ以上の分解はしない
+        return urlparse(url).netloc.lower()
     except Exception:
-        pass
-    return ("不明", "不明")
+        return ""
+
+
+def load_source_catalog(csv_path):
+    """
+    data/news_sources.csv を読み、以下の2種類のインデックスを作る:
+      - domain_map: 公式サイトのドメイン -> 行(dict)
+      - name_map:   媒体名(小文字)       -> 行(dict)
+    期待される列: name, country, continent, language, website_url, city, flag_emoji, political_stance, economic_stance
+    """
+    domain_map = {}
+    name_map = {}
+    if not os.path.exists(csv_path):
+        return domain_map, name_map
+
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            name = (row.get("name") or "").strip()
+            if not name:
+                continue
+            # name マップ
+            name_map[name.lower()] = row
+            # domain マップ（website_url があればドメイン抽出）
+            site = (row.get("website_url") or "").strip()
+            if site:
+                d = _netloc(site)
+                if d:
+                    domain_map[d] = row
+    return domain_map, name_map
+
+
+def enrich_from_catalog(source_name: str, link_url: str, domain_map, name_map):
+    """
+    リンクのドメイン -> catalog 照合、ダメなら source_name の部分一致/完全一致で照合。
+    戻り値: (country, continent, language, catalog_name)  いずれも無ければ None
+    """
+    # 1) ドメイン一致（最も信頼度高）
+    d = _netloc(link_url)
+    if d and d in domain_map:
+        row = domain_map[d]
+        return (
+            (row.get("country") or "").strip() or None,
+            (row.get("continent") or "").strip() or None,
+            (row.get("language") or "").strip() or None,
+            (row.get("name") or "").strip() or None,
+        )
+
+    # 2) 媒体名で一致（小文字完全一致）
+    key = (source_name or "").strip().lower()
+    if key in name_map:
+        row = name_map[key]
+        return (
+            (row.get("country") or "").strip() or None,
+            (row.get("continent") or "").strip() or None,
+            (row.get("language") or "").strip() or None,
+            (row.get("name") or "").strip() or None,
+        )
+
+    # 3) 部分一致（例: "The Guardian - World" に "the guardian" を含む）
+    for nm, row in name_map.items():
+        if nm and nm in key:
+            return (
+                (row.get("country") or "").strip() or None,
+                (row.get("continent") or "").strip() or None,
+                (row.get("language") or "").strip() or None,
+                (row.get("name") or "").strip() or None,
+            )
+
+    return None, None, None, None
+
+
+# ========= ここまで：CSVカタログ =========
+
 
 def estimate_reading_time(text):
     """要約/本文の語数から読了時間(分)を概算。最低1分。"""
     words = len((text or "").split())
     return max(1, round(words / 200))  # 200 wpm を仮定
+
 
 def main():
     os.makedirs(DOCS_PATH, exist_ok=True)
@@ -166,6 +189,9 @@ def main():
     # --- フィードリスト読込
     with open(FEEDS_TXT, "r", encoding="utf-8") as f:
         feed_urls = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
+
+    # --- カタログ読込（存在しなくてもOK）
+    domain_map, name_map = load_source_catalog(CATALOG_CSV)
 
     # --- 収集
     raw_items = []
@@ -190,7 +216,7 @@ def main():
         except Exception:
             # フィードごとの失敗は無視して続行
             pass
-        time.sleep(0.3)  # 取得間隔（優しめに）
+        time.sleep(0.3)  # 取得間隔（やさしめ）
 
     # --- 重複排除（link中心）
     seen = set()
@@ -209,24 +235,35 @@ def main():
     translated = []
     for it in uniq:
         t_title, lang1 = maybe_translate(it["title"])
-        # タイトルで判定した言語をサマリへ引き継ぎ（無ければサマリで自動判定）
         t_sum, lang2 = maybe_translate(it["summary"], src_hint=lang1)
-        detected = lang1 or lang2
+        detected = lang1 or lang2  # 'en','fr'のようなISOコードが入る可能性
 
         it["title_translated"] = t_title
         it["summary_translated"] = t_sum
-        it["lang_detected"] = detected  # ISOコード（例: en, fr）
+        it["lang_detected"] = detected
 
         translated.append(it)
         if LT_URL:
             time.sleep(0.4)  # 無料API配慮
 
-    # --- Base44 推奨スキーマに整形
+    # --- Base44 推奨スキーマに整形（CSVカタログで国/大陸/言語を付与）
     formatted = []
     for it in translated:
-        country, continent = guess_region(it["link"])
+        # CSVカタログで enrich
+        cat_country, cat_continent, cat_lang, cat_name = enrich_from_catalog(
+            source_name=it.get("source", ""),
+            link_url=it.get("link", ""),
+            domain_map=domain_map,
+            name_map=name_map,
+        )
 
-        # 読了時間は「翻訳済み要約 > 原文要約 > タイトル」で概算
+        # language優先順位: CSVの日本語表記(例: "英語") > 自動検出(ISOコード) > "unknown"
+        language_value = cat_lang or (it.get("lang_detected") or "unknown")
+
+        # source_name は CSVにある場合はCSVの name を優先（なければ feed の source）
+        source_name = cat_name or it.get("source", "")
+
+        # 読了時間は翻訳済み要約→原文要約→タイトルで概算
         basis = it.get("summary_translated") or it.get("summary") or it.get("title")
         reading_time = estimate_reading_time(basis)
 
@@ -236,11 +273,11 @@ def main():
             "summary": it.get("summary", ""),
             "summary_translated": it.get("summary_translated", "") or it.get("summary", ""),
             "link": it.get("link", ""),
-            "source_name": it.get("source", ""),
+            "source_name": source_name,
             "published": it.get("published", ""),
-            "language": (it.get("lang_detected") or "unknown"),
-            "country": country,
-            "continent": continent,
+            "language": language_value,           # 例: CSVなら「英語」などの日本語。無ければ 'en' など。
+            "country": cat_country or "不明",
+            "continent": cat_continent or "不明",
             "category": it.get("category", "general"),
             "reading_time_minutes": int(reading_time),
         })
@@ -254,6 +291,7 @@ def main():
 
     with open(FEED_OUT, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
+
 
 if __name__ == "__main__":
     main()
