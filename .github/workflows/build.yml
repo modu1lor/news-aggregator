@@ -1,0 +1,30 @@
+name: build-feed
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 毎日 3:00(JSTで昼間負荷を避けたいなら適宜変更)
+  workflow_dispatch:       # 手動実行ボタンを出す
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: |
+          pip install feedparser requests langdetect python-dateutil
+      - name: Aggregate & translate
+        env:
+          TARGET_LANG: ja
+          # 翻訳オフ運用なら下2つは未設定のままでOK
+          LT_URL: ${{ secrets.LT_URL }}          # 例: https://libretranslate.de
+          LT_API_KEY: ${{ secrets.LT_API_KEY }}  # 使わないなら空でOK
+        run: python tools/aggregate_and_translate.py
+      - name: Commit output
+        run: |
+          git config user.name "news-bot"
+          git config user.email "bot@example.com"
+          git add docs/feed.json
+          git diff --cached --quiet || git commit -m "update feed.json"
+          git push
